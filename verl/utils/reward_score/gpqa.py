@@ -12,37 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import re
 
+def extract_solution(solution_str, method='strict'):
+    """
+    Extract the final answer choice from an LLM's response to a multiple-choice GPQA question.
+    
+    Args:
+        solution_str (str): The full text response from the LLM
+        method (str): 'strict' for exact format matching, 'flexible' for more lenient matching
+        
+    Returns:
+        str: The extracted answer choice (A, B, C, or D) or None if not found
+    """
+    assert method in ['strict', 'flexible']
 
-def extract_solution(solution_str, method="strict"):
-    assert method in ["strict", "flexible"]
-
-    if method == "strict":
-        # this also tests the formatting of the model
-        solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
+    if method == 'strict':
+        # Use regex from OpenAI simple-eval https://github.com/openai/simple-evals/blob/main/gpqa_eval.py
+        solution = re.search(r"(?i)Answer[ \t]*:[ \t]*\$?([A-D])\$?", solution_str)
         if solution is None:
             final_answer = None
         else:
-            final_answer = solution.group(0)
-            final_answer = final_answer.split("#### ")[1].replace(",", "").replace("$", "")
-    elif method == "flexible":
-        answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
+            final_answer = solution.group(1)
+    elif method == 'flexible':
+        answer = re.findall(r"\(([A-D])\)", solution_str)
         final_answer = None
         if len(answer) == 0:
-            # no reward is there is no answer
+            # No answer choices found in parentheses
             pass
         else:
-            invalid_str = ["", "."]
-            # find the last number that is not '.'
+            invalid_str = ['']
+            # Find the last letter that is a valid answer choice
             for final_answer in reversed(answer):
                 if final_answer not in invalid_str:
                     break
+    
     return final_answer
 
 
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
-    """The scoring function for GSM8k.
+def compute_score(solution_str, ground_truth, method='strict', format_score=0., score=1., extra_info=None):
+    """The scoring function for GPQA.
 
     Reference: Trung, Luong, et al. "Reft: Reasoning with reinforced fine-tuning." Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers). 2024.
 
@@ -55,9 +65,9 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
     """
     answer = extract_solution(solution_str=solution_str, method=method)
     if answer is None:
-        return 0
+        return {'score': 0, 'acc': 0}
     else:
         if answer == ground_truth:
-            return score
+            return {'score': score, 'acc': 1.}
         else:
-            return format_score
+            return {'score': format_score, 'acc': 0.}
