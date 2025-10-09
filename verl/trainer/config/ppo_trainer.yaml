@@ -101,6 +101,10 @@ algorithm:
     # Target KL divergence (used for adaptive controller)
     target_kl: 0.1
 
+  hierarchical:
+    enable: true         # 功能开关：设为 true 来启用分层模式
+    num_segments: 20      # 定义你想要的总段落数
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

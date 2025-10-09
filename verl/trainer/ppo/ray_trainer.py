@@ -60,6 +60,57 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
+## new functions for hierarchical ppo
+def _segment_by_entropy(entropys: torch.Tensor, response_masks: torch.Tensor, num_segments: int):
+    """
+    根据熵将序列分割成指定数量的段落。
+    Args:
+        entropys (torch.Tensor): 每个 token 的熵, shape (batch_size, seq_len)
+        response_masks (torch.Tensor): 响应部分的掩码, shape (batch_size, seq_len)
+        num_segments (int): 想要分割成的总段落数
+
+    Returns:
+        list[list[int]]: 每个样本的分段边界列表，例如 [[0, 15, 30, 50], [0, 22, 45, 60]]
+    """
+    if num_segments <= 1:
+        # 如果只分一段，则边界就是开始和结束
+        all_segment_boundaries = []
+        for i in range(entropys.shape[0]):
+            num_valid_tokens = int(response_masks[i].sum())
+            all_segment_boundaries.append([0, num_valid_tokens])
+        return all_segment_boundaries
+
+    k_splits = num_segments - 1 # 分割点的数量
+    batch_size = entropys.shape[0]
+    all_segment_boundaries = []
+
+    for i in range(batch_size):
+        num_valid_tokens = int(response_masks[i].sum())
+        # 只在有效 token 上计算
+        valid_entropies = entropys[i, :num_valid_tokens]
+        
+        # 确保有足够的 token 来分割
+        # 我们不在第一个和最后一个 token 处分割，所以至少需要 k+2 个 token
+        if num_valid_tokens > k_splits + 1:
+            # 添加微小噪声以打破熵值相同的情况
+            target_slice = valid_entropies[1:-1]
+            noise = torch.randn_like(target_slice) * 1e-6
+            # 在 (0, num_valid_tokens-1) 范围内寻找分割点
+            _, split_indices_tensor = torch.topk(target_slice + noise, k=k_splits)
+
+            split_indices_tensor += 1  # 恢复原始索引
+            # --- 关键修改 1: 在这里就将 Tensor 转换为 list ---
+            split_indices = split_indices_tensor.tolist()
+        else:
+            # 如果 token 不够，则不分割 (这本身就是一个 list)
+            split_indices = []
+
+        # --- 关键修改 2: 现在 split_indices 保证是 list，直接使用即可 ---
+        # 构造边界列表，格式为 [0, split_1, split_2, ..., num_valid_tokens]
+        boundaries = sorted(list(set([0] + split_indices + [num_valid_tokens])))
+        all_segment_boundaries.append(boundaries)
+        
+    return all_segment_boundaries
 
 @dataclass
 class ResourcePoolManager:
@@ -1107,21 +1158,77 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        ### HRL START: 分层强化学习逻辑 ###
+                        # 检查配置是否启用分层模式
+                        h_config = self.config.algorithm.get("hierarchical", {})
+                        if h_config.get("enable", False):
+                            print("--- Running Hierarchical RL Step ---")
+                            
+                            # 步骤 1: 根据熵进行分段
+                            num_segments = h_config.get("num_segments", 5)
+                            boundaries = _segment_by_entropy(
+                                entropys=entropys,
+                                response_masks=batch.batch["response_mask"],
+                                num_segments=num_segments,
+                            )
+                            
+                            # 步骤 2: 聚合数据到段落级别
+                            batch_size = entropys.shape[0]
+                            device = entropys.device
+                            seg_rewards = torch.zeros(batch_size, num_segments, device=device)
+                            seg_values = torch.zeros(batch_size, num_segments, device=device)
+                            seg_mask = torch.zeros(batch_size, num_segments, device=device)
+                            
+                            # 最终任务得分
+                            final_scores = batch.batch["token_level_rewards"].sum(dim=-1)
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                            for i in range(batch_size):
+                                num_actual_segments = len(boundaries[i]) - 1
+                                if num_actual_segments > 0:
+                                    seg_mask[i, :num_actual_segments] = 1.0
+                                    
+                                    # 核心：只给最后一个段落分配最终奖励
+                                    last_segment_idx = num_actual_segments - 1
+                                    seg_rewards[i, last_segment_idx] = final_scores[i]
+                                    
+                                    # 聚合价值（段落起始）和log_probs（段落内求和）
+                                    for j in range(num_actual_segments):
+                                        start_idx, end_idx = boundaries[i][j], boundaries[i][j+1]
+                                        seg_values[i, j] = batch.batch["values"][i, start_idx]
 
+                            # 步骤 3: 在段落级别计算 GAE
+                            seg_advantages, seg_returns = core_algos.compute_gae_advantage_return(
+                                token_level_rewards=seg_rewards,
+                                values=seg_values,
+                                response_mask=seg_mask,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                            )
+                            
+                            # 步骤 4: 将优势广播回 Token 级别
+                            token_advantages = torch.zeros_like(batch.batch["token_level_rewards"])
+                            for i in range(batch_size):
+                                for j in range(len(boundaries[i]) - 1):
+                                    start_idx, end_idx = boundaries[i][j], boundaries[i][j+1]
+                                    token_advantages[i, start_idx:end_idx] = seg_advantages[i, j]
+                                    
+                            # 步骤 5: 覆盖 batch 中的 advantages 和 returns
+                            batch.batch["advantages"] = token_advantages
+                            batch.batch["returns"] = token_advantages + batch.batch["values"]
+                        
+                        else:
+                            # 如果未启用分层模式，则执行原始的 GAE 计算
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+                        ### HRL END ###
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):

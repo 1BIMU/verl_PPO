@@ -1,7 +1,7 @@
 set -x
 
 
-export CUDA_VISIBLE_DEVICES=6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 train_path=/workspace/verl/data/dapo-math-17k.parquet
 aime_test_path=/workspace/verl/data/offline_eval/math__aime_repeated_8x_240.parquet
@@ -45,7 +45,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir='/data1/wty/qwen0.5B_PPO_ckpts' \
     trainer.project_name='PPO' \
     trainer.experiment_name='qwen0.5B_PPO' \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=10 \
