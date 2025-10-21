@@ -1304,7 +1304,7 @@ def compute_policy_loss_geo_mean(
 
 
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
-    """Compute categorical entropy loss (For backward compatibility)
+    """Computes categorical entropy loss (For backward compatibility)
 
     Args:
         logits (torch.Tensor): shape is (bs, response_length, vocab_size)
